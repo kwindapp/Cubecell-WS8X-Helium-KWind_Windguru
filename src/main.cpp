@@ -3,158 +3,574 @@
 #include "ws8x.h"
 #include "keys.h"
 
+// Defined by the CubeCell framework
 extern bool wakeByUart;
-extern bool g_lora_debug = true;
-/* OTAA para*/
+
+// LoRaWAN library debug output
+bool g_lora_debug = true;
+
+// =============================================
+// CONFIGURATION
+// =============================================
+
+static const uint8_t PAYLOAD_SIZE = 18;
+static const uint32_t DATA_RETRY_INTERVAL_MS = 5000UL;
+
+// =============================================
+// OTAA PARAMETERS
+// =============================================
+
 uint8_t devEui[8] = NODE_DEVICE_EUI;
 uint8_t appEui[8] = NODE_APP_EUI;
 uint8_t appKey[16] = NODE_APP_KEY;
 
-/* ABP para*/
-uint8_t nwkSKey[] = {0x15, 0xb1, 0xd0, 0xef, 0xa4, 0x63, 0xdf, 0xbe, 0x3d, 0x11, 0x18, 0x1e, 0x1e, 0xc7, 0xda, 0x85};
-uint8_t appSKey[] = {0xd7, 0x2c, 0x78, 0x75, 0x8c, 0xdc, 0xca, 0xbf, 0x55, 0xee, 0x4a, 0x77, 0x8d, 0x16, 0xef, 0x67};
-uint32_t devAddr = (uint32_t)0x007e6ae1;
+// =============================================
+// ABP PARAMETERS
+// =============================================
 
-/*LoraWan channelsmask, default channels 0-7*/
-uint16_t userChannelsMask[6] = {0xFF00, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000};
+uint8_t nwkSKey[16] = {
+    0x15, 0xB1, 0xD0, 0xEF,
+    0xA4, 0x63, 0xDF, 0xBE,
+    0x3D, 0x11, 0x18, 0x1E,
+    0x1E, 0xC7, 0xDA, 0x85
+};
 
-/*LoraWan region, select in arduino IDE tools*/
+uint8_t appSKey[16] = {
+    0xD7, 0x2C, 0x78, 0x75,
+    0x8C, 0xDC, 0xCA, 0xBF,
+    0x55, 0xEE, 0x4A, 0x77,
+    0x8D, 0x16, 0xEF, 0x67
+};
+
+uint32_t devAddr = (uint32_t)0x007E6AE1;
+
+// =============================================
+// LORAWAN SETTINGS
+// =============================================
+
+/*
+ * EU868 channels 0-7 enabled.
+ *
+ * The previous value 0xFF00 enabled bits 8-15 instead
+ * of the normal first eight EU868 channels.
+ */
+uint16_t userChannelsMask[6] = {
+    0x00FF,
+    0x0000,
+    0x0000,
+    0x0000,
+    0x0000,
+    0x0000
+};
+
+// Region selected in Arduino IDE / PlatformIO
 LoRaMacRegion_t loraWanRegion = ACTIVE_REGION;
 
-/*LoraWan Class, Class A and Class C are supported*/
+// Class selected in Arduino IDE / PlatformIO
 DeviceClass_t loraWanClass = LORAWAN_CLASS;
 
-/*the application data transmission duty cycle.  value in [ms].*/
-uint32_t appTxDutyCycle = 60000;
+// Normal transmission interval
+uint32_t appTxDutyCycle = 60000UL;
 
-/*OTAA or ABP*/
+// OTAA or ABP
 bool overTheAirActivation = LORAWAN_NETMODE;
 
-/*ADR enable*/
-bool loraWanAdr = false; //LORAWAN_ADR;
+// Adaptive Data Rate
+bool loraWanAdr = false;
 
-/* set LORAWAN_Net_Reserve ON, the node could save the network info to flash, when node reset not need to join again */
+// Preserve network session in flash
 bool keepNet = LORAWAN_NET_RESERVE;
 
-/* Indicates if the node is sending confirmed or unconf
-irmed messages */
+// Confirmed or unconfirmed uplinks
 bool isTxConfirmed = LORAWAN_UPLINKMODE;
 
-/* Application port */
+// LoRaWAN application port
 uint8_t appPort = 2;
 
+// Number of confirmed-uplink attempts
 uint8_t confirmedNbTrials = 4;
+
+// =============================================
+// STATUS VARIABLES
+// =============================================
+
+static unsigned long lastWaitingPrint = 0;
+static unsigned long successfulPackets = 0;
+
+// =============================================
+// HELPER FUNCTIONS
+// =============================================
+
+static void printHexArray(
+    const uint8_t* data,
+    uint8_t size
+)
+{
+    for (uint8_t i = 0; i < size; i++) {
+        Serial.printf("%02X", data[i]);
+    }
+}
+
+static void printStartupInformation()
+{
+    Serial.println();
+    Serial.println("==========================================");
+    Serial.println("CubeCell WS80/WS85 LoRaWAN Transmitter");
+    Serial.println("------------------------------------------");
+
+    Serial.print("DevEUI: ");
+    printHexArray(devEui, sizeof(devEui));
+    Serial.println();
+
+    Serial.print("AppEUI: ");
+    printHexArray(appEui, sizeof(appEui));
+    Serial.println();
+
+    Serial.printf(
+        "Duty cycle: %lu ms (%lu minute(s))\n",
+        appTxDutyCycle,
+        appTxDutyCycle / 60000UL
+    );
+
+    Serial.printf(
+        "Payload size: %u bytes\n",
+        PAYLOAD_SIZE
+    );
+
+    Serial.printf(
+        "Region: %d\n",
+        loraWanRegion
+    );
+
+    Serial.printf(
+        "Class: %d\n",
+        loraWanClass
+    );
+
+    Serial.printf(
+        "Activation: %s\n",
+        overTheAirActivation ? "OTAA" : "ABP"
+    );
+
+    Serial.printf(
+        "ADR: %s\n",
+        loraWanAdr ? "enabled" : "disabled"
+    );
+
+    Serial.printf(
+        "Uplink: %s\n",
+        isTxConfirmed ? "confirmed" : "unconfirmed"
+    );
+
+    Serial.println("==========================================");
+    Serial.println();
+}
+
+static void printPayload()
+{
+    Serial.printf(
+        "[LORAWAN] Payload size: %u bytes\n",
+        appDataSize
+    );
+
+    Serial.print("[LORAWAN] Payload HEX: ");
+
+    for (uint8_t i = 0; i < appDataSize; i++) {
+        Serial.printf("%02X", appData[i]);
+    }
+
+    Serial.println();
+}
+
+static void scheduleNextCycle(uint32_t interval)
+{
+    txDutyCycleTime =
+        interval +
+        randr(0, APP_TX_DUTYCYCLE_RND);
+
+    Serial.printf(
+        "[LORAWAN] Next cycle in approximately %lu seconds\n",
+        txDutyCycleTime / 1000UL
+    );
+
+    LoRaWAN.cycle(txDutyCycleTime);
+    deviceState = DEVICE_STATE_SLEEP;
+}
+
+// =============================================
+// SETUP
+// =============================================
 
 void setup()
 {
 #ifdef INTERVAL_MINUTES
-	appTxDutyCycle = INTERVAL_MINUTES * 60000;
+    appTxDutyCycle =
+        (uint32_t)INTERVAL_MINUTES *
+        60000UL;
 #endif
-	boardInitMcu();
-	Serial.begin(115200);
-	delay(5000);
-	deviceState = DEVICE_STATE_INIT;
-	LoRaWAN.ifskipjoin();
-	// Adjust the size of the payload to the 18 bytes populated from WS8X
-	appDataSize = 18;
-	Serial.printf("app data size %d\r\n", appDataSize);		
-	wakeByUart = true;
+
+    boardInitMcu();
+
+    Serial.begin(115200);
+    delay(3000);
+
+    printStartupInformation();
+
+    // -----------------------------------------
+    // Initialize WS80 receive-only UART
+    // -----------------------------------------
+
+    Serial.println("[WS8X] Initializing sensor receiver");
+
+    ws8x_init();
+
+    Serial.println("[WS8X] Sensor receiver initialized");
+    Serial.println("[WS8X] WS80 TX -> CubeCell UART_RX");
+    Serial.println("[WS8X] CubeCell UART_TX disconnected");
+
+    // -----------------------------------------
+    // Configure LoRaWAN
+    // -----------------------------------------
+
+    appDataSize = PAYLOAD_SIZE;
+
+    /*
+     * Allow UART activity to wake the CubeCell so
+     * incoming WS80 data can continue to be processed.
+     */
+    wakeByUart = true;
+
+    /*
+     * Start the standard CubeCell LoRaWAN state machine.
+     */
+    deviceState = DEVICE_STATE_INIT;
+
+    /*
+     * Uses the framework's network-reserve setting.
+     * When a valid stored session exists, joining can
+     * be skipped according to the framework settings.
+     */
+    LoRaWAN.ifskipjoin();
+
+    Serial.println();
+    Serial.println("[SYSTEM] Ready");
+    Serial.println("[SYSTEM] Collecting WS80 readings");
+    Serial.println("[SYSTEM] Initializing LoRaWAN");
+    Serial.println();
 }
+
+// =============================================
+// MAIN LOOP
+// =============================================
 
 void loop()
 {
-	ws8x_checkSerial();
-	// Serial.print(".");
-	switch (deviceState)
-	{
-	case DEVICE_STATE_INIT:
-	{
-// #if (AT_SUPPORT)
-// 		getDevParam();
-// #endif
-		printDevParam();
-		LoRaWAN.init(loraWanClass, loraWanRegion);
-		deviceState = DEVICE_STATE_JOIN;
-		break;
-	}
-	case DEVICE_STATE_JOIN:
-	{
-		LoRaWAN.join();
-		break;
-	}
-	case DEVICE_STATE_SEND:
-	{
-		ws8x_populate_lora_buffer(appData, appDataSize);
-		LoRaWAN.send();
-		deviceState = DEVICE_STATE_CYCLE;
-		break;
-	}
-	case DEVICE_STATE_CYCLE:
-	{
-		// Schedule next packet transmission
-		txDutyCycleTime = appTxDutyCycle + randr(0, APP_TX_DUTYCYCLE_RND);
-		LoRaWAN.cycle(txDutyCycleTime);
-		deviceState = DEVICE_STATE_SLEEP;
-		break;
-	}
-	case DEVICE_STATE_SLEEP:
-	{
+    /*
+     * Always process UART data before handling the
+     * LoRaWAN state machine.
+     */
+    ws8x_checkSerial();
 
-		LoRaWAN.sleep();
-		break;
-	}
-	default:
-	{
-		deviceState = DEVICE_STATE_INIT;
-		break;
-	}
-	}
+    switch (deviceState)
+    {
+        // =====================================
+        // INITIALIZE LORAWAN
+        // =====================================
 
+        case DEVICE_STATE_INIT:
+        {
+            Serial.println(
+                "[LORAWAN] Initializing stack"
+            );
+
+            LoRaWAN.init(
+                loraWanClass,
+                loraWanRegion
+            );
+
+            deviceState = DEVICE_STATE_JOIN;
+
+            Serial.println(
+                "[LORAWAN] Stack initialized"
+            );
+
+            break;
+        }
+
+        // =====================================
+        // JOIN NETWORK
+        // =====================================
+
+        case DEVICE_STATE_JOIN:
+        {
+            /*
+             * Important:
+             *
+             * Do not manually overwrite deviceState here.
+             * LoRaWAN.join() changes it to DEVICE_STATE_SEND
+             * after a successful join.
+             */
+            Serial.println(
+                "[LORAWAN] Joining network"
+            );
+
+            LoRaWAN.join();
+
+            break;
+        }
+
+        // =====================================
+        // PREPARE AND SEND PAYLOAD
+        // =====================================
+
+        case DEVICE_STATE_SEND:
+        {
+            /*
+             * Only upload after MIN_READINGS valid and
+             * recent WS80 readings have been collected.
+             */
+            if (!ws8x_has_valid_data()) {
+                if (
+                    millis() - lastWaitingPrint >=
+                    10000UL
+                ) {
+                    lastWaitingPrint = millis();
+
+                    Serial.println(
+                        "[LORAWAN] Waiting for WS80 readings"
+                    );
+
+                    ws8x_print_data();
+                }
+
+                /*
+                 * Retry soon instead of waiting for the
+                 * complete normal transmission interval.
+                 */
+                scheduleNextCycle(
+                    DATA_RETRY_INTERVAL_MS
+                );
+
+                break;
+            }
+
+            Serial.println();
+            Serial.println(
+                "[LORAWAN] Preparing uplink"
+            );
+
+            appDataSize = PAYLOAD_SIZE;
+
+            /*
+             * Clear the complete LoRaWAN payload before
+             * writing the new sensor values.
+             */
+            memset(
+                appData,
+                0,
+                appDataSize
+            );
+
+            ws8x_populate_lora_buffer(
+                appData,
+                appDataSize
+            );
+
+            printPayload();
+
+            /*
+             * LoRaWAN.send() uses appData, appDataSize
+             * and appPort from the global variables.
+             */
+            LoRaWAN.send();
+
+            successfulPackets++;
+
+            Serial.printf(
+                "[LORAWAN] Uplink submitted, packet #%lu\n",
+                successfulPackets
+            );
+
+            /*
+             * Start a fresh averaging interval only after
+             * the packet has been submitted.
+             */
+            ws8x_reset_counters();
+
+            deviceState = DEVICE_STATE_CYCLE;
+
+            break;
+        }
+
+        // =====================================
+        // NORMAL TRANSMISSION CYCLE
+        // =====================================
+
+        case DEVICE_STATE_CYCLE:
+        {
+            scheduleNextCycle(
+                appTxDutyCycle
+            );
+
+            break;
+        }
+
+        // =====================================
+        // LOW-POWER SLEEP
+        // =====================================
+
+        case DEVICE_STATE_SLEEP:
+        {
+            /*
+             * Read pending WS80 UART bytes before entering
+             * the CubeCell low-power handler.
+             */
+            ws8x_checkSerial();
+
+            LoRaWAN.sleep();
+
+            break;
+        }
+
+        // =====================================
+        // RECOVERY
+        // =====================================
+
+        default:
+        {
+            Serial.println(
+                "[SYSTEM] Invalid state; restarting LoRaWAN"
+            );
+
+            deviceState = DEVICE_STATE_INIT;
+
+            break;
+        }
+    }
+
+    delay(10);
 }
 
-void downLinkDataHandle(McpsIndication_t *mcpsIndication)
+// =============================================
+// DOWNLINK HANDLER
+// =============================================
+
+void downLinkDataHandle(
+    McpsIndication_t* mcpsIndication
+)
 {
-    Serial.printf("Received downlink: %d bytes\n", mcpsIndication->BufferSize);
-    
-    // Print received data in hex
-    Serial.print("Hex: ");
-    for(uint8_t i = 0; i < mcpsIndication->BufferSize; i++) {
-        Serial.printf("%02X ", mcpsIndication->Buffer[i]);
+    if (mcpsIndication == NULL) {
+        Serial.println(
+            "[DOWNLINK] Invalid indication"
+        );
+
+        return;
     }
+
     Serial.println();
-    
-    // Print received data in ASCII
+    Serial.println("==========================================");
+    Serial.println("LORAWAN DOWNLINK RECEIVED");
+    Serial.println("------------------------------------------");
+
+    Serial.printf(
+        "Port: %u\n",
+        mcpsIndication->Port
+    );
+
+    Serial.printf(
+        "Size: %u bytes\n",
+        mcpsIndication->BufferSize
+    );
+
+    Serial.print("HEX: ");
+
+    for (
+        uint8_t i = 0;
+        i < mcpsIndication->BufferSize;
+        i++
+    ) {
+        Serial.printf(
+            "%02X ",
+            mcpsIndication->Buffer[i]
+        );
+    }
+
+    Serial.println();
+
     Serial.print("ASCII: ");
-    for(uint8_t i = 0; i < mcpsIndication->BufferSize; i++) {
-        Serial.print((char)mcpsIndication->Buffer[i]);
+
+    for (
+        uint8_t i = 0;
+        i < mcpsIndication->BufferSize;
+        i++
+    ) {
+        uint8_t character =
+            mcpsIndication->Buffer[i];
+
+        if (
+            character >= 32 &&
+            character <= 126
+        ) {
+            Serial.print((char)character);
+        } else {
+            Serial.print('.');
+        }
     }
+
     Serial.println();
-    
-    // Check for "reboot" command (6 bytes)
-    if(mcpsIndication->BufferSize == 6) {
-        char cmd[7];  // +1 for null terminator
-        memcpy(cmd, mcpsIndication->Buffer, 6);
-        cmd[6] = '\0';
-        
-        if(strcmp(cmd, "reboot") == 0) {
-            Serial.println("Rebooting...");
-            delay(1000);  // Give some time for the message to be sent
+    Serial.println("==========================================");
+
+    // -----------------------------------------
+    // REBOOT COMMAND
+    // -----------------------------------------
+
+    if (mcpsIndication->BufferSize == 6) {
+        char command[7];
+
+        memcpy(
+            command,
+            mcpsIndication->Buffer,
+            6
+        );
+
+        command[6] = '\0';
+
+        if (strcmp(command, "reboot") == 0) {
+            Serial.println(
+                "[DOWNLINK] Reboot command received"
+            );
+
+            delay(1000);
             NVIC_SystemReset();
             return;
         }
     }
-    
-    // Handle duty cycle changes
-    if(mcpsIndication->BufferSize == 1) {
-        uint8_t value = mcpsIndication->Buffer[0];
-        
-        // Check if it's an ASCII number (0x30-0x39)
-        if(value >= '0' && value <= '9') {
-            uint8_t minutes = value - '0';  // Convert ASCII to number
-            if(minutes >= 1) {  // No need to check upper bound since single digit
-                appTxDutyCycle = (uint32_t)minutes * 60000; // Convert minutes to milliseconds
-                Serial.printf("New duty cycle set to: %d minutes (%lu ms)\n", minutes, appTxDutyCycle);
-            }
+
+    // -----------------------------------------
+    // DUTY-CYCLE COMMAND
+    // -----------------------------------------
+
+    if (mcpsIndication->BufferSize == 1) {
+        uint8_t value =
+            mcpsIndication->Buffer[0];
+
+        /*
+         * ASCII values "1" through "9" set the normal
+         * transmission interval in minutes.
+         */
+        if (value >= '1' && value <= '9') {
+            uint8_t minutes =
+                value - '0';
+
+            appTxDutyCycle =
+                (uint32_t)minutes *
+                60000UL;
+
+            Serial.printf(
+                "[DOWNLINK] Duty cycle changed to %u minute(s), %lu ms\n",
+                minutes,
+                appTxDutyCycle
+            );
         }
     }
 }
