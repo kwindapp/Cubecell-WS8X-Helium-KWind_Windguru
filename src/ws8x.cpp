@@ -3,13 +3,11 @@
 #include <math.h>
 
 // Variables for wind data
-static double dir_sum_sin = 0;
-static double dir_sum_cos = 0;
-static float velSum = 0;
-static float gust = 0;
-static float lull = -1;
-static int velCount = 0;
-static int dirCount = 0;
+static float currentWindDir = 0;    // Store current direction
+static float currentWindSpeed = 0;  // Store current speed
+static float currentGust = 0;       // Store current gust
+static float currentLull = 0;       // Store current lull
+static float currentTemp = 0;       // Store current temperature
 
 // Variables for other metrics
 static float batVoltageF = 0;
@@ -18,87 +16,92 @@ static float temperatureF = 0;
 static float rain = 0;
 static int rainSum = 0;
 
+// Store raw readings for better averaging
+#define MAX_READINGS 60
+static float windSpeeds[MAX_READINGS];
+static float windDirs[MAX_READINGS];
+static int readingCount = 0;
+
+// Gateway matching settings
+#define WIND_AVG_PERIOD 60  // 60 seconds
+#define MIN_WIND_SPEED_FOR_DIR 0.5  // Ignore direction below this speed (m/s)
+
 void ws8x_init()
 {
-    // already called in main setup so nothing to do here.
-    // Initialize serial or anything related to ws8x
-    // Serial.begin(115200);
+    // Initialize arrays
+    memset(windSpeeds, 0, sizeof(windSpeeds));
+    memset(windDirs, 0, sizeof(windDirs));
+    readingCount = 0;
 }
 
 void ws8x_checkSerial()
 {
-    const int maxIterations = 100; // Maximum number of lines to read per loop
+    const int maxIterations = 100;
     int iterationCount = 0;
-    // Check if data is available on the serial port
+    
     while (Serial.available() > 0 && iterationCount < maxIterations)
     {
         iterationCount++;
         String line = Serial.readStringUntil('\n');
         line.trim();
+        
 #ifdef PRINT_WX_SERIAL
         Serial.println(line);
-#else
-        Serial.print('.');
 #endif
+        
         if (line.length() > 0)
         {
-            // Find the '=' character
             int index = line.indexOf('=');
             if (index != -1)
             {
-                // Split into key and value, removing whitespace
                 String key = line.substring(0, index);
                 String value = line.substring(index + 1);
                 key.trim();
                 value.trim();
 
-                // Remove 'V' suffix from voltage readings if present
                 if (value.endsWith("V"))
                 {
                     value = value.substring(0, value.length() - 1);
                 }
 
-                // Now parse based on the key
+                // Store current values as they arrive
                 if (key == "WindDir")
                 {
-                    float windDir = value.toFloat();
-                    double radians = windDir * M_PI / 180.0;
-                    dir_sum_sin += sin(radians);
-                    dir_sum_cos += cos(radians);
-                    dirCount++;
+                    currentWindDir = value.toFloat();
+                    if (readingCount < MAX_READINGS) {
+                        windDirs[readingCount] = currentWindDir;
+                    }
                 }
                 else if (key == "WindSpeed")
                 {
-                    float windSpeed = value.toFloat();
-                    velSum += windSpeed;
-                    velCount++;
-                    if (lull == -1 || windSpeed < lull)
-                        lull = windSpeed;
+                    currentWindSpeed = value.toFloat();
+                    if (readingCount < MAX_READINGS) {
+                        windSpeeds[readingCount] = currentWindSpeed;
+                        readingCount++;
+                    }
                 }
                 else if (key == "WindGust")
                 {
-                    float windGust = value.toFloat();
-                    if (windGust > gust)
-                        gust = windGust;
+                    currentGust = value.toFloat();
                 }
                 else if (key == "BatVoltage")
                 {
                     batVoltageF = value.toFloat();
                 }
-                // WS85: CapVoltage, WS80: Humidity
                 else if (key == "CapVoltage")
                 {
-                    capVoltageF = value.toFloat(); // Capacitor voltage for WS85
+                    capVoltageF = value.toFloat();
                 }
                 else if (key == "Humi")
                 {
-                    capVoltageF = value.toFloat(); // Humidity for WS80
+                    capVoltageF = value.toFloat();
                 }
-                else if (key == "GXTS04Temp" || key == "Temperature") // Handle both sensor types
+                else if (key == "GXTS04Temp" || key == "Temperature")
                 {
-                    if (value != "--") // Check for valid temperature
+                    if (value != "--")
                     {
                         temperatureF = value.toFloat();
+                        currentTemp = temperatureF;
                     }
                 }
                 else if (key == "Rain")
@@ -115,58 +118,119 @@ void ws8x_checkSerial()
     }
 }
 
+// Calculate wind direction using circular median (more stable than vector average)
+float calculateWindDirection(float* directions, int count, float* speeds) {
+    if (count == 0) return 0;
+    
+    // Only calculate direction if wind speed is above threshold
+    float avgSpeed = 0;
+    int speedCount = 0;
+    for (int i = 0; i < count; i++) {
+        if (speeds[i] > MIN_WIND_SPEED_FOR_DIR) {
+            avgSpeed += speeds[i];
+            speedCount++;
+        }
+    }
+    
+    if (speedCount == 0) return 0;  // No significant wind
+    
+    // Use a simpler approach: most common direction range
+    // Group directions into 10-degree bins
+    int bins[36] = {0};
+    int maxBin = 0;
+    int maxBinIndex = 0;
+    
+    for (int i = 0; i < count; i++) {
+        if (speeds[i] > MIN_WIND_SPEED_FOR_DIR) {
+            int bin = (int)(directions[i] / 10) % 36;
+            bins[bin]++;
+            if (bins[bin] > maxBin) {
+                maxBin = bins[bin];
+                maxBinIndex = bin;
+            }
+        }
+    }
+    
+    // Return the center of the most common bin
+    float result = (maxBinIndex * 10) + 5;
+    if (result >= 360) result -= 360;
+    
+    return result;
+}
+
+float calculateWindSpeedAverage(float* speeds, int count) {
+    if (count == 0) return 0;
+    
+    float sum = 0;
+    for (int i = 0; i < count; i++) {
+        sum += speeds[i];
+    }
+    return sum / count;
+}
+
 void ws8x_populate_lora_buffer(uint8_t* m_lora_app_data, int size)
 {
-    uint16_t deviceVoltage_mv = getBatteryVoltage(); // * REAL_VBAT_MV_PER_LSB);
-    Serial.printf("Battery voltage : %d\n\r", deviceVoltage_mv);
+    uint16_t deviceVoltage_mv = getBatteryVoltage();
+    Serial.printf("Battery voltage : %d mV\n\r", deviceVoltage_mv);
     
-    // Calculate averages
-    float velAvg = (velCount > 0) ? velSum / velCount : 0;
-    double avgSin = (dirCount > 0) ? dir_sum_sin / dirCount : 0;
-    double avgCos = (dirCount > 0) ? dir_sum_cos / dirCount : 0;
-    double avgRadians = atan2(avgSin, avgCos);
-    float dirAvg = avgRadians * 180.0 / 3.141592653589793; // Use proper PI value
-    if (dirAvg < 0)
-        dirAvg += 360.0;
+    // Calculate averages using stored readings
+    float velAvg = calculateWindSpeedAverage(windSpeeds, readingCount);
+    
+    // Calculate direction using improved method
+    float dirAvg = calculateWindDirection(windDirs, readingCount, windSpeeds);
+    
+    // Use current gust (already the maximum from the gateway)
+    float gust = currentGust;
+    float lull = 0;
+    
+    // Find actual lull from stored readings
+    if (readingCount > 0) {
+        lull = windSpeeds[0];
+        for (int i = 1; i < readingCount; i++) {
+            if (windSpeeds[i] < lull) {
+                lull = windSpeeds[i];
+            }
+        }
+    }
 
-    // Print data
+    // Print data for debugging
     Serial.printf("Wind Speed Avg: %.1f m/s, Wind Dir Avg: %d°, Gust: %.1f m/s, Lull: %.1f m/s\n",
                   velAvg, (int)dirAvg, gust, lull);
     Serial.printf("Battery Voltage: %.1f V, Capacitor/Humidity: %.1f, Temperature: %.1f °C\n",
                   batVoltageF, capVoltageF, temperatureF);
-    Serial.printf("Rain: %.1f mm, Device mv : %d\n", rain, deviceVoltage_mv);
+    Serial.printf("Rain: %.1f mm, Device mv : %d, Readings: %d\n", rain, deviceVoltage_mv, readingCount);
 
     // Populate the buffer
-    // Clear the buffer
     memset(m_lora_app_data, 0, size);
 
-    // Round the values appropriately
+    // Round the values (matching gateway precision)
     float roundedVelAvg = round(velAvg * 10) / 10.0;
-    float roundedDirAvg = round(dirAvg);                     // No decimal for direction
+    float roundedDirAvg = round(dirAvg);                     // Integer degrees
     float roundedGust = round(gust * 10) / 10.0;
-    float roundedLull = (lull == -1) ? 0 : round(lull * 10) / 10.0;
+    float roundedLull = round(lull * 10) / 10.0;
     float roundedBatVoltageF = round(batVoltageF * 10) / 10.0;
     float roundedCapVoltageF = round(capVoltageF * 10) / 10.0;
     float roundedTemperatureF = round(temperatureF * 10) / 10.0;
     float roundedRain = round(rain * 10) / 10.0;
 
     // Convert values to integers with proper scaling
-    int16_t intDirAvg = (int16_t)(roundedDirAvg);                 // No scaling (0-359)
-    int16_t intVelAvg = (int16_t)(roundedVelAvg * 10);            // Scale to 1 decimal place
-    int16_t intGust = (int16_t)(roundedGust * 10);                // Scale to 1 decimal place
-    int16_t intLull = (int16_t)(roundedLull * 10);                // Scale to 1 decimal place
-    int16_t intBatVoltageF = (int16_t)(roundedBatVoltageF * 100); // Scale to 2 decimal places
-    int16_t intCapVoltageF = (int16_t)(roundedCapVoltageF * 100); // Scale to 2 decimal places (WS85: Volts, WS80: Humidity %)
-    int16_t intTemperatureF = (int16_t)(roundedTemperatureF * 10); // Scale to 1 decimal place
-    uint16_t intRain = (uint16_t)(roundedRain * 10);              // Scale to 1 decimal place
+    int16_t intDirAvg = (int16_t)roundedDirAvg;              // 0-359
+    int16_t intVelAvg = (int16_t)(roundedVelAvg * 10);       // 1 decimal
+    int16_t intGust = (int16_t)(roundedGust * 10);           // 1 decimal
+    int16_t intLull = (int16_t)(roundedLull * 10);           // 1 decimal
+    int16_t intBatVoltageF = (int16_t)(roundedBatVoltageF * 100); // 2 decimals
+    int16_t intCapVoltageF = (int16_t)(roundedCapVoltageF * 100); // 2 decimals
+    int16_t intTemperatureF = (int16_t)(roundedTemperatureF * 10); // 1 decimal
+    uint16_t intRain = (uint16_t)(roundedRain * 10);         // 1 decimal
     
-    // Pack the integers into the buffer in a specific order
+    // Pack the integers into the buffer
     int offset = 0;
     memcpy(&m_lora_app_data[offset], &intDirAvg, sizeof(int16_t));
     offset += sizeof(int16_t);
     memcpy(&m_lora_app_data[offset], &intVelAvg, sizeof(int16_t));
     offset += sizeof(int16_t);
-    #ifndef SEND_MIN_BYTES
+    
+#ifndef SEND_MIN_BYTES
     Serial.println("populating full buffer of 18 bytes");
     memcpy(&m_lora_app_data[offset], &intGust, sizeof(int16_t));
     offset += sizeof(int16_t);
@@ -182,7 +246,7 @@ void ws8x_populate_lora_buffer(uint8_t* m_lora_app_data, int size)
     offset += sizeof(uint16_t);
     memcpy(&m_lora_app_data[offset], &deviceVoltage_mv, sizeof(uint16_t));
     offset += sizeof(uint16_t);
-    #endif
+#endif
 
     // Print debug information
     Serial.print("Payload bytes: ");
@@ -194,17 +258,22 @@ void ws8x_populate_lora_buffer(uint8_t* m_lora_app_data, int size)
 }
 
 void ws8x_reset_counters() {
-    // Reset counters
-    dir_sum_sin = dir_sum_cos = 0; // Reset wind direction sums
-    velSum = 0;                    // Reset wind speed sum
-    velCount = dirCount = 0;       // Reset wind direction and speed counts
-    gust = 0;                      // Reset gust
-    lull = -1;                     // Reset lull
-
+    // Reset stored readings
+    memset(windSpeeds, 0, sizeof(windSpeeds));
+    memset(windDirs, 0, sizeof(windDirs));
+    readingCount = 0;
+    
+    // Reset current values
+    currentWindDir = 0;
+    currentWindSpeed = 0;
+    currentGust = 0;
+    currentLull = 0;
+    currentTemp = 0;
+    
     // Reset other metrics
-    batVoltageF = 0;  // Reset battery voltage
-    capVoltageF = 0;  // Reset capacitor voltage / humidity
-    temperatureF = 0; // Reset temperature
-    rain = 0;         // Reset rain
-    rainSum = 0;      // Reset rain sum
+    batVoltageF = 0;
+    capVoltageF = 0;
+    temperatureF = 0;
+    rain = 0;
+    rainSum = 0;
 }
