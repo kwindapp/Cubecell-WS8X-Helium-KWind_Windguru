@@ -13,7 +13,7 @@ static int dirCount = 0;
 
 // Variables for other metrics
 static float batVoltageF = 0;
-static float capVoltageF = 0;
+static float capVoltageF = 0;      // WS85: Capacitor Voltage, WS80: Humidity
 static float temperatureF = 0;
 static float rain = 0;
 static int rainSum = 0;
@@ -85,10 +85,14 @@ void ws8x_checkSerial()
                 {
                     batVoltageF = value.toFloat();
                 }
-                // WS85 has CapVoltage, WS80 has Humidity. Just use the same var
-                else if (key == "CapVoltage" || key == "Humi")
+                // WS85: CapVoltage, WS80: Humidity
+                else if (key == "CapVoltage")
                 {
-                    capVoltageF = value.toFloat();
+                    capVoltageF = value.toFloat(); // Capacitor voltage for WS85
+                }
+                else if (key == "Humi")
+                {
+                    capVoltageF = value.toFloat(); // Humidity for WS80
                 }
                 else if (key == "GXTS04Temp" || key == "Temperature") // Handle both sensor types
                 {
@@ -110,50 +114,52 @@ void ws8x_checkSerial()
         Serial.println("Maximum serial reading iterations reached");
     }
 }
+
 void ws8x_populate_lora_buffer(uint8_t* m_lora_app_data, int size)
 {
     uint16_t deviceVoltage_mv = getBatteryVoltage(); // * REAL_VBAT_MV_PER_LSB);
     Serial.printf("Battery voltage : %d\n\r", deviceVoltage_mv);
+    
     // Calculate averages
     float velAvg = (velCount > 0) ? velSum / velCount : 0;
     double avgSin = (dirCount > 0) ? dir_sum_sin / dirCount : 0;
     double avgCos = (dirCount > 0) ? dir_sum_cos / dirCount : 0;
     double avgRadians = atan2(avgSin, avgCos);
-    float dirAvg = avgRadians * 180.0 / 3.14; // Convert to degrees
+    float dirAvg = avgRadians * 180.0 / 3.141592653589793; // Use proper PI value
     if (dirAvg < 0)
         dirAvg += 360.0;
 
     // Print data
     Serial.printf("Wind Speed Avg: %.1f m/s, Wind Dir Avg: %d°, Gust: %.1f m/s, Lull: %.1f m/s\n",
                   velAvg, (int)dirAvg, gust, lull);
-    Serial.printf("Battery Voltage: %.1f V, Capacitor Voltage: %.1f V, Temperature: %.1f °C\n",
+    Serial.printf("Battery Voltage: %.1f V, Capacitor/Humidity: %.1f, Temperature: %.1f °C\n",
                   batVoltageF, capVoltageF, temperatureF);
     Serial.printf("Rain: %.1f mm, Device mv : %d\n", rain, deviceVoltage_mv);
 
     // Populate the buffer
-
     // Clear the buffer
     memset(m_lora_app_data, 0, size);
 
-    // Round the values to one decimal place
+    // Round the values appropriately
     float roundedVelAvg = round(velAvg * 10) / 10.0;
-    float roundedDirAvg = round(dirAvg);
+    float roundedDirAvg = round(dirAvg);                     // No decimal for direction
     float roundedGust = round(gust * 10) / 10.0;
-    float roundedLull = round(lull * 10) / 10.0;
+    float roundedLull = (lull == -1) ? 0 : round(lull * 10) / 10.0;
     float roundedBatVoltageF = round(batVoltageF * 10) / 10.0;
     float roundedCapVoltageF = round(capVoltageF * 10) / 10.0;
     float roundedTemperatureF = round(temperatureF * 10) / 10.0;
     float roundedRain = round(rain * 10) / 10.0;
 
-    // Convert values to integers
-    int16_t intVelAvg = (int16_t)(roundedVelAvg * 10);             // Scale to 1 decimal place
-    int16_t intDirAvg = (int16_t)(roundedDirAvg * 10);             // Scale to 1 decimal place
-    int16_t intGust = (int16_t)(roundedGust * 10);                 // Scale to 1 decimal place
-    int16_t intLull = (int16_t)(roundedLull * 10);                 // Scale to 1 decimal place
-    int16_t intBatVoltageF = (int16_t)(roundedBatVoltageF * 100);  // Scale to 2 decimal places
-    int16_t intCapVoltageF = (int16_t)(roundedCapVoltageF * 100);  // Scale to 2 decimal places
+    // Convert values to integers with proper scaling
+    int16_t intDirAvg = (int16_t)(roundedDirAvg);                 // No scaling (0-359)
+    int16_t intVelAvg = (int16_t)(roundedVelAvg * 10);            // Scale to 1 decimal place
+    int16_t intGust = (int16_t)(roundedGust * 10);                // Scale to 1 decimal place
+    int16_t intLull = (int16_t)(roundedLull * 10);                // Scale to 1 decimal place
+    int16_t intBatVoltageF = (int16_t)(roundedBatVoltageF * 100); // Scale to 2 decimal places
+    int16_t intCapVoltageF = (int16_t)(roundedCapVoltageF * 100); // Scale to 2 decimal places (WS85: Volts, WS80: Humidity %)
     int16_t intTemperatureF = (int16_t)(roundedTemperatureF * 10); // Scale to 1 decimal place
-    uint16_t intRain = (uint16_t)(roundedRain * 10);               // Scale to 1 decimal place
+    uint16_t intRain = (uint16_t)(roundedRain * 10);              // Scale to 1 decimal place
+    
     // Pack the integers into the buffer in a specific order
     int offset = 0;
     memcpy(&m_lora_app_data[offset], &intDirAvg, sizeof(int16_t));
@@ -182,7 +188,7 @@ void ws8x_populate_lora_buffer(uint8_t* m_lora_app_data, int size)
     Serial.print("Payload bytes: ");
     for (int i = 0; i < offset; i++)
     {
-        Serial.printf("%02X", m_lora_app_data[i]);  // Removed the &
+        Serial.printf("%02X", m_lora_app_data[i]);
     }
     Serial.println();
 }
@@ -197,7 +203,7 @@ void ws8x_reset_counters() {
 
     // Reset other metrics
     batVoltageF = 0;  // Reset battery voltage
-    capVoltageF = 0;  // Reset capacitor voltage
+    capVoltageF = 0;  // Reset capacitor voltage / humidity
     temperatureF = 0; // Reset temperature
     rain = 0;         // Reset rain
     rainSum = 0;      // Reset rain sum
