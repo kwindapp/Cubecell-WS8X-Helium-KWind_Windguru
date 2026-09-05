@@ -1,3 +1,32 @@
+/*
+ * ============================================================================
+ *                 KWind - Windguru Network LoRaWAN Firmware
+ * ============================================================================
+ *
+ *  Project:     KWind Live Wind Station Network
+ *  Module:      CubeCell AB01 / AB01 V2 LoRaWAN Transmitter
+ *  Sensor:      Fine Offset / Ecowitt WS80 and WS85
+ *  Integration: KWind and Windguru live-wind data network
+ *  Release:     September 2026
+ *
+ *  Description:
+ *  Receives calibrated ultrasonic wind and weather measurements from a
+ *  WS80/WS85 sensor over UART, creates an 18-byte LoRaWAN payload, and
+ *  transmits the measurements to the KWind live-wind infrastructure for
+ *  network integration and forwarding.
+ *
+ *  Copyright (c) 2026 KWind Hekiumsmartworld KLG Switzerland
+ *  All rights reserved.
+ *
+ *  This source code is proprietary KWind software. Unauthorized copying,
+ *  modification, redistribution, publication, sublicensing, or commercial
+ *  use of this software, in whole or in part, is prohibited without prior
+ *  written permission from the copyright owner.
+ *
+ *  KWind and Windguru remain the property of their respective owners.
+ * ============================================================================
+ */
+
 #include "LoRaWan_APP.h"
 #include "Arduino.h"
 #include "ws8x.h"
